@@ -10,5 +10,8 @@ build/
 *.egg-info/
 /data/
 *.db
+*.db-wal
+*.db-shm
+*.db.lock
 secrets/
 .DS_Store

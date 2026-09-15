@@ -1,8 +1,8 @@
-"""Risk gates: bankroll, open count, notional, cooldown, daily loss, fees."""
-
+"""Preflight and final execution checks, including pending capital reservations."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from tayder.config import Settings
@@ -15,7 +15,10 @@ class RiskState:
     last_trade_at: datetime | None = None
     day_realized_pnl: float = 0.0
     day_key: str = ""
-    cash_usd: float | None = None  # paper cash; None → use bankroll
+    cash_usd: float | None = None
+    holdings: dict[str, float] = field(default_factory=dict)
+    reserved_cash: float = 0.0
+    reserved_positions: int = 0
 
 
 @dataclass(frozen=True)
@@ -25,69 +28,61 @@ class RiskDecision:
     stake_usd: float = 0.0
 
 
-def _today_key(now: datetime | None = None) -> str:
-    return (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
-
-
 def refresh_day(state: RiskState, now: datetime | None = None) -> None:
-    key = _today_key(now)
+    key = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
     if state.day_key != key:
         state.day_key = key
         state.day_realized_pnl = 0.0
 
 
-def check_proposal(
-    proposal: Proposal,
-    settings: Settings,
-    state: RiskState,
-    *,
-    now: datetime | None = None,
-    expected_edge_bps: float | None = None,
-) -> RiskDecision:
-    """Return whether proposal may proceed and the capped stake."""
+def check_proposal(proposal: Proposal, settings: Settings, state: RiskState, *,
+                   now: datetime | None = None, expected_edge_bps: float | None = None,
+                   spread_bps: float = 0.0) -> RiskDecision:
     now = now or datetime.now(timezone.utc)
     refresh_day(state, now)
-
-    if getattr(settings, "killed", False):
+    if settings.killed:
         return RiskDecision(False, "kill_switch")
-
+    if proposal.is_expired(now):
+        return RiskDecision(False, "expired")
     if proposal.side not in (Side.BUY, Side.SELL):
         return RiskDecision(False, "invalid_side")
-
-    bankroll = settings.bankroll_usd
-    if bankroll <= 0 or bankroll > 10:
+    if proposal.product_id not in settings.strategy_pairs:
+        return RiskDecision(False, "invalid_product")
+    if not math.isfinite(settings.bankroll_usd) or not 0 < settings.bankroll_usd <= 10:
         return RiskDecision(False, "bankroll_out_of_bounds")
+    if not all(math.isfinite(v) and v > 0 for v in (proposal.notional_usd, proposal.signal_price)):
+        return RiskDecision(False, "invalid_amount")
+    if settings.is_live:
+        if not settings.coinbase_api_key_name or not settings.private_key_pem():
+            return RiskDecision(False, "live_credentials_missing")
+        if not settings.discord_allowlist:
+            return RiskDecision(False, "live_allowlist_missing")
+    if proposal.side == Side.SELL:
+        size = state.holdings.get(proposal.product_id, 0.0)
+        if not math.isfinite(size) or size <= 0:
+            return RiskDecision(False, "no_inventory")
+        stake = min(proposal.notional_usd, size * proposal.signal_price)
+        if stake < settings.min_notional_usd:
+            return RiskDecision(False, "below_min_notional", stake)
+        # Risk-reducing exits do not need cash and remain possible after a loss stop.
+        return RiskDecision(True, "ok", stake)
 
-    cash = state.cash_usd if state.cash_usd is not None else bankroll
-    stake = min(float(proposal.notional_usd), bankroll, max(cash, 0.0))
+    cash = state.cash_usd if state.cash_usd is not None else settings.bankroll_usd
+    if not math.isfinite(cash):
+        return RiskDecision(False, "invalid_cash")
+    stake = min(proposal.notional_usd, settings.bankroll_usd,
+                max(cash - state.reserved_cash, 0.0) / (1 + settings.taker_fee_bps / 10_000))
     if stake < settings.min_notional_usd:
         return RiskDecision(False, "below_min_notional", stake)
-
-    if state.open_positions >= settings.max_open_positions:
-        if proposal.side == Side.BUY:
-            return RiskDecision(False, "max_open_positions", stake)
-
-    if state.last_trade_at is not None:
-        elapsed = (now - state.last_trade_at).total_seconds()
-        if elapsed < settings.cooldown_seconds:
-            return RiskDecision(False, "cooldown", stake)
-
-    loss_limit = -(bankroll * settings.daily_loss_stop_pct)
-    if state.day_realized_pnl <= loss_limit:
+    if state.open_positions + state.reserved_positions >= settings.max_open_positions:
+        return RiskDecision(False, "max_open_positions", stake)
+    if state.last_trade_at and (now - state.last_trade_at).total_seconds() < settings.cooldown_seconds:
+        return RiskDecision(False, "cooldown", stake)
+    if state.day_realized_pnl <= -(settings.bankroll_usd * settings.daily_loss_stop_pct):
         return RiskDecision(False, "daily_loss_stop", stake)
-
-    # Fee dominance: when an expected edge is known, refuse if RT fees
-    # consume it (plus fee_dominance_bps buffer). Skip if edge unknown.
-    if expected_edge_bps is not None:
-        rt_fee_bps = settings.taker_fee_bps * 2
-        if expected_edge_bps <= rt_fee_bps + settings.fee_dominance_bps:
-            return RiskDecision(False, "fee_dominance", stake)
-
-    if settings.is_live:
-        has_creds = bool(
-            settings.coinbase_api_key_name and settings.private_key_pem()
-        )
-        if not has_creds:
-            return RiskDecision(False, "live_credentials_missing", stake)
-
+    if expected_edge_bps is None or not math.isfinite(expected_edge_bps):
+        return RiskDecision(False, "edge_unknown", stake)
+    required = 2 * settings.taker_fee_bps + settings.fee_dominance_bps + spread_bps + 2 * settings.slippage_bps
+    if expected_edge_bps <= required:
+        return RiskDecision(False, "fee_dominance", stake)
     return RiskDecision(True, "ok", stake)

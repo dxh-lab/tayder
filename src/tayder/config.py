@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,6 +47,48 @@ class Settings:
     coinbase_api_key_file: str = ""
     coinbase_api_base: str = "https://api.coinbase.com"
     killed: bool = False  # runtime kill-switch (mutable via object.replace)
+    max_spread_bps: float = 50.0
+    max_price_drift_bps: float = 50.0
+    max_book_age_seconds: int = 60
+    slippage_bps: float = 10.0
+
+    def validate(self) -> None:
+        if self.mode not in ("paper", "live"):
+            raise ValueError("MODE must be paper or live")
+        if self.coinbase_api_base != "https://api.coinbase.com":
+            raise ValueError("COINBASE_API_BASE must be https://api.coinbase.com")
+        for name in ("bankroll_usd", "min_notional_usd", "taker_fee_bps", "maker_fee_bps",
+                     "fee_dominance_bps", "daily_loss_stop_pct", "max_spread_bps",
+                     "max_price_drift_bps", "slippage_bps"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"Invalid {name}")
+        if not 0 < self.bankroll_usd <= 10:
+            raise ValueError("bankroll must be positive and at most $10")
+        if not 0 < self.min_notional_usd <= self.bankroll_usd:
+            raise ValueError("Invalid min_notional_usd")
+        if not 0 < self.daily_loss_stop_pct <= 1:
+            raise ValueError("Invalid daily_loss_stop_pct")
+        if self.max_open_positions != 1:
+            raise ValueError("MAX_OPEN_POSITIONS must be 1")
+        if self.taker_fee_bps >= 10_000 or self.slippage_bps >= 10_000:
+            raise ValueError("Fee and slippage rates must be below 10000 bps")
+        for name in ("cooldown_seconds", "proposal_expiry_seconds", "poll_interval_seconds",
+                     "max_book_age_seconds", "max_open_positions", "candle_granularity_seconds"):
+            if type(getattr(self, name)) is not int:
+                raise ValueError(f"{name} must be an integer")
+        if self.cooldown_seconds < 0 or min(self.proposal_expiry_seconds,
+                self.poll_interval_seconds, self.max_book_age_seconds) <= 0:
+            raise ValueError("Invalid time limits")
+        if self.candle_granularity_seconds != 900:
+            raise ValueError("The baseline requires 15-minute candles")
+        if not self.strategy_pairs or len(set(self.strategy_pairs)) != len(self.strategy_pairs) or not set(self.strategy_pairs) <= {"BTC-USD", "ETH-USD"}:
+            raise ValueError("STRATEGY_PAIRS must contain unique BTC-USD/ETH-USD spot pairs")
+        if self.is_live:
+            if not self.discord_allowlist or any(uid <= 0 for uid in self.discord_allowlist):
+                raise ValueError("LIVE requires DISCORD_ALLOWLIST_USER_IDS")
+            if not self.coinbase_api_key_name or not self.private_key_pem():
+                raise ValueError("LIVE requires Coinbase credentials")
 
     @property
     def is_live(self) -> bool:
@@ -63,7 +106,7 @@ def load_settings(env_file: str | None = None) -> Settings:
     allow = _csv("DISCORD_ALLOWLIST_USER_IDS")
     pairs = _csv("STRATEGY_PAIRS", "BTC-USD,ETH-USD")
     channel = os.getenv("DISCORD_CHANNEL_ID", "0") or "0"
-    bankroll = min(_f("BANKROLL_USD", 10.0), 10.0)
+    bankroll = _f("BANKROLL_USD", 10.0)
     return Settings(
         discord_token=os.getenv("DISCORD_TOKEN", ""),
         discord_channel_id=int(channel),
@@ -86,4 +129,8 @@ def load_settings(env_file: str | None = None) -> Settings:
         coinbase_api_private_key=os.getenv("COINBASE_API_PRIVATE_KEY", ""),
         coinbase_api_key_file=os.getenv("COINBASE_API_KEY_FILE", ""),
         coinbase_api_base=os.getenv("COINBASE_API_BASE", "https://api.coinbase.com"),
+        max_spread_bps=_f("MAX_SPREAD_BPS", 50),
+        max_price_drift_bps=_f("MAX_PRICE_DRIFT_BPS", 50),
+        max_book_age_seconds=_i("MAX_BOOK_AGE_SECONDS", 60),
+        slippage_bps=_f("SLIPPAGE_BPS", 10),
     )

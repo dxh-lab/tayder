@@ -40,15 +40,15 @@ def _prop(**kwargs) -> Proposal:
 
 
 def test_ok_basic():
-    d = check_proposal(_prop(), _settings(), RiskState())
+    d = check_proposal(_prop(), _settings(), RiskState(), expected_edge_bps=300)
     assert d.ok
     assert d.stake_usd == 5.0
 
 
 def test_stake_capped_to_bankroll():
-    d = check_proposal(_prop(notional_usd=50), _settings(bankroll_usd=10), RiskState())
+    d = check_proposal(_prop(notional_usd=50), _settings(bankroll_usd=10), RiskState(), expected_edge_bps=300)
     assert d.ok
-    assert d.stake_usd == 10.0
+    assert d.stake_usd * 1.006 == pytest.approx(10.0)
 
 
 def test_bankroll_over_10_refused():
@@ -81,7 +81,7 @@ def test_max_open_allows_sell():
     d = check_proposal(
         _prop(side=Side.SELL),
         _settings(),
-        RiskState(open_positions=1),
+        RiskState(open_positions=1, holdings={"BTC-USD": 0.0001}),
     )
     assert d.ok
 
@@ -139,3 +139,24 @@ def test_live_missing_creds():
     )
     assert not d.ok
     assert d.reason == "live_credentials_missing"
+
+
+def test_missing_or_nonfinite_edge_never_bypasses_buy_cost_gate():
+    for edge in (None, float('nan'), float('inf')):
+        d = check_proposal(_prop(), _settings(), RiskState(), expected_edge_bps=edge)
+        assert not d.ok and d.reason == 'edge_unknown'
+
+
+def test_pending_cash_and_position_reservations_are_enforced():
+    d = check_proposal(_prop(), _settings(), RiskState(cash_usd=5, reserved_cash=5), expected_edge_bps=500)
+    assert not d.ok and d.reason == 'below_min_notional'
+    d = check_proposal(_prop(), _settings(), RiskState(reserved_positions=1), expected_edge_bps=500)
+    assert not d.ok and d.reason == 'max_open_positions'
+
+
+def test_day_rollover_clears_only_current_day_gate():
+    state = RiskState(day_realized_pnl=-5, day_key='2026-01-01')
+    decision = check_proposal(_prop(), _settings(), state, expected_edge_bps=500,
+                             now=datetime(2026, 1, 2, tzinfo=timezone.utc))
+    assert decision.ok
+    assert state.day_key == '2026-01-02' and state.day_realized_pnl == 0

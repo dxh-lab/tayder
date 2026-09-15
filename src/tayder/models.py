@@ -21,6 +21,7 @@ class Side(str, Enum):
 class ProposalStatus(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"
+    SUBMITTING = "submitting"
     SKIPPED = "skipped"
     EXPIRED = "expired"
     EXECUTED = "executed"

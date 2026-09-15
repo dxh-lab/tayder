@@ -1,20 +1,24 @@
-"""Main paper/live loop: signal → risk → Discord approve → execute → journal."""
-
+"""Durable, single-owner approval → final checks → submit → reconcile loop."""
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
+import fcntl
 import logging
+import math
+from pathlib import Path
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import timedelta
 
+from tayder.account import Account
 from tayder.approve.state import ApprovalStore
 from tayder.config import Settings, load_settings
 from tayder.data.market import CoinbasePublicMarket
-from tayder.execute.live import LiveCoinbaseExecutor, MissingCredentialsExecutor
+from tayder.execute.live import LiveCoinbaseExecutor, OrderAmbiguous, OrderRejected
 from tayder.execute.paper import paper_fill
 from tayder.journal.db import Journal
-from tayder.models import Proposal, Side, utcnow
+from tayder.models import Fill, Proposal, ProposalStatus as S, Side, utcnow
 from tayder.notify.discord_bot import TayderBot
 from tayder.risk.gates import RiskState, check_proposal
 from tayder.strategy.baseline import mean_reversion_signal
@@ -22,198 +26,371 @@ from tayder.strategy.baseline import mean_reversion_signal
 log = logging.getLogger(__name__)
 
 
-@dataclass
-class KillSwitch:
-    engaged: bool = False
-
-
 class Worker:
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(self, settings: Settings | None = None, *, market=None, executor=None) -> None:
         self.settings = settings or load_settings()
-        self.kill = KillSwitch(False)
-        self.store = ApprovalStore(
-            default_ttl_seconds=self.settings.proposal_expiry_seconds
-        )
-        self.journal = Journal(self.settings.journal_db_path)
-        self.market = CoinbasePublicMarket()
-        self.risk_state = RiskState(cash_usd=self.settings.bankroll_usd)
-        self._pending_stake: dict[str, float] = {}
-        self._lock = threading.Lock()
+        self.settings.validate()
+        self._lock = threading.RLock()
+        self._kill_requested = threading.Event()
+        self._owner = None
+        self._closed = False
+        path = self.settings.journal_db_path
+        if path != ":memory:":
+            # All runtimes sharing a journal must share this lifetime lock too.
+            path = str(Path(path).resolve())
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            self._owner = open(path + ".lock", "a")
+            try:
+                fcntl.flock(self._owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                self._owner.close()
+                raise RuntimeError("Another Tayder worker owns this journal") from None
+        try:
+            self.journal = Journal(path)
+            binding = {"mode": self.settings.mode, "bankroll_usd": self.settings.bankroll_usd,
+                       "key_name": self.settings.coinbase_api_key_name if self.settings.is_live else ""}
+            saved_binding = self.journal.get_state("binding")
+            saved_account = self.journal.get_state("account")
+            if saved_binding is not None and saved_binding != binding:
+                raise ValueError("Journal mode, bankroll or Coinbase key differs; use its original configuration")
+            if saved_binding is None:
+                # Old live fills were estimates. Do not silently declare them settled.
+                if (any(f["mode"] == "live" for f in self.journal.fills())
+                        or (self.settings.is_live and self.journal.proposals())):
+                    raise ValueError("Legacy live journal needs reconciliation against Coinbase before migration")
+                self.account = Account(self.settings.bankroll_usd, killed=self.settings.killed)
+                for row in self.journal.fills():
+                    from datetime import datetime
+                    self.account.apply(Fill(**{**row, "side": Side(row["side"]),
+                        "filled_at": datetime.fromisoformat(row["filled_at"])}))
+                with self.journal.transaction():
+                    for p in self.journal.proposals():
+                        if p.status in (S.PENDING, S.APPROVED, S.SUBMITTING):
+                            p.status = S.FAILED
+                            p.meta["failure_reason"] = "legacy_proposal_requires_new_approval"
+                            self.journal.save_proposal(p)
+                    self.journal.set_state("account", self.account.to_dict())
+                    self.journal.set_state("binding", binding)
+            else:
+                if saved_account is None:
+                    raise ValueError("Journal is missing its durable account state")
+                self.account = Account.from_dict(saved_account)
+            self.store = ApprovalStore(self.settings.proposal_expiry_seconds, self.journal, lock=self._lock)
+            if self.account.killed or self.settings.killed:
+                self._kill_requested.set()
+            self.store.expire_due()
+        except BaseException:
+            if hasattr(self, "journal"):
+                self.journal.close()
+            if self._owner:
+                self._owner.close()
+            raise
+        self.market = market or CoinbasePublicMarket(max_age_seconds=self.settings.max_book_age_seconds)
+        self.executor = executor or (LiveCoinbaseExecutor(self.settings) if self.settings.is_live else None)
         self.bot: TayderBot | None = None
 
-    def _settings_with_kill(self) -> Settings:
-        return replace(self.settings, killed=self.kill.engaged)
+    @property
+    def killed(self) -> bool:
+        return self._kill_requested.is_set() or self.account.killed
 
     def engage_kill(self) -> None:
-        self.kill.engaged = True
-        self.journal.log_event("kill", {"engaged": True})
-        log.warning("Kill-switch engaged")
+        # Set before waiting on network/worker lock; the final POST guard sees it.
+        self._kill_requested.set()
+        with self._lock:
+            self.account.killed = True
+            with self.journal.transaction():
+                self.journal.set_state("account", self.account.to_dict())
+                for p in self.store.active():
+                    if p.status in (S.PENDING, S.APPROVED):
+                        self.store.transition(p.proposal_id, (p.status,), S.FAILED, failure_reason="kill_switch")
+                self.journal.log_event("kill", {"engaged": True})
 
     def clear_kill(self) -> None:
-        self.kill.engaged = False
-        self.journal.log_event("kill", {"engaged": False})
-        log.info("Kill-switch cleared")
+        with self._lock:
+            self.account.killed = False
+            self.journal.set_state("account", self.account.to_dict())
+            self._kill_requested.clear()
+            self.journal.log_event("kill", {"engaged": False})
 
-    def _executor(self):
-        if not self.settings.is_live:
-            return None
-        if self.settings.coinbase_api_key_name and self.settings.private_key_pem():
-            return LiveCoinbaseExecutor(self.settings)
-        return MissingCredentialsExecutor()
+    def _risk_state(self, exclude: str | None = None) -> RiskState:
+        active = [p for p in self.store.active() if p.proposal_id != exclude]
+        buys = [p for p in active if p.side == Side.BUY]
+        day = utcnow().strftime("%Y-%m-%d")
+        return RiskState(open_positions=len(self.account.positions),
+            cash_usd=self.account.cash_usd, holdings={k: p.size for k, p in self.account.positions.items()},
+            last_trade_at=self.account.last_trade_at, day_key=day,
+            day_realized_pnl=self.account.realized_by_day.get(day, 0.0),
+            reserved_cash=sum(p.notional_usd * (1 + self.settings.taker_fee_bps / 10_000) for p in buys),
+            reserved_positions=len(buys))
+
+    def _book(self, pair):
+        book = self.market.top_of_book(pair)
+        if book.product_id != pair or not all(math.isfinite(v) and v > 0 for v in
+                (book.bid, book.ask, book.bid_size, book.ask_size)) or book.ask < book.bid:
+            raise ValueError("invalid_book")
+        age = (utcnow() - book.ts).total_seconds()
+        if age < -5 or age > self.settings.max_book_age_seconds:
+            raise ValueError("stale_book")
+        if book.spread_bps > self.settings.max_spread_bps:
+            raise ValueError("spread_too_wide")
+        return book
+
+    def _check(self, p: Proposal, book, *, balances=None):
+        if self.killed:
+            raise ValueError("kill_switch")
+        others = [q for q in self.store.active() if q.proposal_id != p.proposal_id]
+        if any(q.status == S.SUBMITTING for q in others):
+            raise ValueError("unresolved_order")
+        if any(q.product_id == p.product_id for q in others):
+            raise ValueError("inventory_reserved")
+        state = self._risk_state(p.proposal_id)
+        if balances is not None:
+            state.cash_usd = min(state.cash_usd, balances.get("USD", 0.0))
+            state.holdings = {pair: min(size, balances.get(pair.split("-")[0], 0.0))
+                              for pair, size in state.holdings.items()}
+        price = book.ask if p.side == Side.BUY else book.bid
+        if not math.isfinite(p.signal_price) or p.signal_price <= 0:
+            raise ValueError("invalid_signal_price")
+        if abs(price / p.signal_price - 1) * 10_000 > self.settings.max_price_drift_bps:
+            raise ValueError("price_drift")
+        # Recompute distance to the original mean at today's executable price.
+        edge = p.meta.get("estimated_edge_bps", p.meta.get("edge_bps"))
+        if "sma" in p.meta:
+            edge = (float(p.meta["sma"]) - price) / price * 10_000
+        current = replace(p, signal_price=price)
+        decision = check_proposal(current, replace(self.settings, killed=self.killed), state,
+            expected_edge_bps=float(edge) if edge is not None else None, spread_bps=book.spread_bps)
+        if not decision.ok:
+            raise ValueError(decision.reason)
+        base_size = None
+        stake = decision.stake_usd
+        if p.side == Side.SELL:
+            # The human approved base size is frozen; never sell more on a price drop.
+            approved_size = float(p.meta.get("base_size", p.notional_usd / p.signal_price))
+            base_size = min(approved_size, state.holdings.get(p.product_id, 0.0))
+            if not math.isfinite(base_size) or base_size <= 0:
+                raise ValueError("no_inventory")
+            stake = base_size * price
+            if stake < self.settings.min_notional_usd:
+                raise ValueError("below_min_notional")
+        return stake, base_size
+
+    def _fail(self, p, reason):
+        self.store.transition(p.proposal_id, (S.PENDING, S.APPROVED, S.SUBMITTING), S.FAILED,
+                              failure_reason=str(reason))
+        self.journal.log_event("execution_reject", {"proposal_id": p.proposal_id, "reason": str(reason)})
+
+    def _book_fill(self, p: Proposal, fill: Fill) -> None:
+        if (fill.proposal_id, fill.product_id, fill.side, fill.mode) != (
+                p.proposal_id, p.product_id, p.side, self.settings.mode):
+            raise ValueError("fill_identity_mismatch")
+        account = deepcopy(self.account)
+        account.apply(fill)
+        complete = replace(p, status=S.EXECUTED, meta={**p.meta, "order_id": fill.order_id})
+        if self.journal.finish(fill, complete, account.to_dict()):
+            self.account = account
+            # Persisted together above; now update the shared in-memory object.
+            p.status, p.meta = complete.status, complete.meta
+            log.info("Confirmed %s %s size=%s fee=%s", fill.side, fill.product_id, fill.size, fill.fee_usd)
+
+    def _reconcile_one(self, p: Proposal) -> None:
+        assert self.executor is not None
+        try:
+            order_id = p.meta.get("order_id")
+            if not order_id:
+                order_id = self.executor.find_order(p.proposal_id)
+                if not order_id:
+                    return  # Eventual visibility is not proof of rejection. Never re-POST.
+                self.store.transition(p.proposal_id, (S.SUBMITTING,), S.SUBMITTING, order_id=order_id)
+            fill = self.executor.reconcile(p, order_id)
+            if fill is not None:
+                self._book_fill(p, fill)
+        except OrderRejected as exc:
+            self._fail(p, exc)
+        except Exception as exc:
+            # A malformed fill or failed local commit cannot erase an accepted order.
+            self.journal.log_event("reconciliation_pending", {"proposal_id": p.proposal_id,
+                                                             "reason": type(exc).__name__})
+            log.warning("Reconciliation pending for %s: %s", p.proposal_id, type(exc).__name__)
+
+    def reconcile_pending(self) -> None:
+        with self._lock:
+            for p in self.store.active():
+                if p.status == S.SUBMITTING:
+                    if self.settings.is_live:
+                        self._reconcile_one(p)
+                    else:
+                        # A paper crash before the atomic fill commit has no external effect.
+                        self._fail(p, "interrupted_paper_execution")
 
     async def on_approved(self, proposal: Proposal) -> None:
         await asyncio.to_thread(self._execute_approved, proposal)
 
     def _execute_approved(self, proposal: Proposal) -> None:
         with self._lock:
-            stake = self._pending_stake.pop(proposal.proposal_id, proposal.notional_usd)
+            self.store.expire_due()
+            p = self.store.get(proposal.proposal_id)
+            if p is None or p.status != S.APPROVED:
+                return
+            submitting = False
             try:
-                book = self.market.top_of_book(proposal.product_id)
+                balances = self.executor.balances() if self.settings.is_live else None
+                book = self._book(p.product_id)
+                stake, base_size = self._check(p, book, balances=balances)
                 if self.settings.is_live:
-                    ex = self._executor()
-                    assert ex is not None
-                    fill = ex.execute(proposal, stake)
+                    sizing = self.executor.prepare(p, stake, base_size)
+                    self.executor.verify_permissions()
+                    stake = float(sizing.get("quote_size", stake))
+                    # Prepare must only round down. Keep actual intent durable before POST.
+                    if base_size is not None:
+                        base_size = float(sizing["base_size"])
+                    self.store.transition(p.proposal_id, (S.APPROVED,), S.SUBMITTING,
+                        stake_usd=stake, **sizing)
+                    submitting = True
+
+                    def final_guard():
+                        available = self.executor.balances()
+                        latest = self._book(p.product_id)
+                        allowed_stake, allowed_base = self._check(p, latest, balances=available)
+                        if stake > allowed_stake + 1e-9 and p.side == Side.BUY:
+                            raise ValueError("cash_changed")
+                        if base_size is not None and base_size > allowed_base + 1e-12:
+                            raise ValueError("inventory_changed")
+
+                    order_id = self.executor.submit(p, stake, before_submit=final_guard)
+                    self.store.transition(p.proposal_id, (S.SUBMITTING,), S.SUBMITTING, order_id=order_id)
+                    self._reconcile_one(p)
                 else:
-                    fill = paper_fill(
-                        proposal,
-                        book,
-                        stake_usd=stake,
-                        taker_fee_bps=self.settings.taker_fee_bps,
-                    )
-                self.store.mark_executed(proposal.proposal_id)
-                self.journal.save_fill(fill)
-                proposal.status = proposal.status  # already updated in store
-                self.journal.save_proposal(self.store.get(proposal.proposal_id) or proposal)
-                if proposal.side == Side.BUY:
-                    self.risk_state.open_positions += 1
-                    if self.risk_state.cash_usd is not None:
-                        self.risk_state.cash_usd -= stake + fill.fee_usd
+                    self.store.transition(p.proposal_id, (S.APPROVED,), S.SUBMITTING, stake_usd=stake)
+                    submitting = True
+                    self._check(p, book)
+                    fill = paper_fill(p, book, stake_usd=stake,
+                        base_size=base_size, taker_fee_bps=self.settings.taker_fee_bps,
+                        slippage_bps=self.settings.slippage_bps)
+                    self._book_fill(p, fill)
+            except (OrderRejected, ValueError) as exc:
+                # These execution API exceptions guarantee no uncertain POST.
+                # Booking failures following POST are handled inside reconciliation.
+                self._fail(p, exc)
+            except Exception as exc:
+                if submitting and self.settings.is_live:
+                    if isinstance(exc, OrderAmbiguous) and exc.order_id:
+                        self.store.transition(p.proposal_id, (S.SUBMITTING,), S.SUBMITTING, order_id=exc.order_id)
+                    self.journal.log_event("submission_uncertain", {"proposal_id": p.proposal_id,
+                                                                   "reason": type(exc).__name__})
                 else:
-                    self.risk_state.open_positions = max(
-                        0, self.risk_state.open_positions - 1
-                    )
-                    if self.risk_state.cash_usd is not None:
-                        self.risk_state.cash_usd += stake - fill.fee_usd
-                self.risk_state.last_trade_at = utcnow()
-                self.journal.log_event(
-                    "fill",
-                    {"order_id": fill.order_id, "proposal_id": fill.proposal_id},
-                )
-                log.info("Filled %s %s @ %s", fill.side, fill.product_id, fill.price)
-            except Exception:
-                log.exception("Execute failed for %s", proposal.proposal_id)
-                try:
-                    self.store.mark_failed(proposal.proposal_id)
-                    failed = self.store.get(proposal.proposal_id)
-                    if failed:
-                        self.journal.save_proposal(failed)
-                except Exception:
-                    pass
+                    self._fail(p, type(exc).__name__)
 
     def scan_once(self) -> list[Proposal]:
-        """Generate proposals that pass risk; register for approval."""
-        if self.kill.engaged:
-            return []
-        out: list[Proposal] = []
-        settings = self._settings_with_kill()
-        for pair in settings.strategy_pairs:
-            try:
-                candles = self.market.candles(
-                    pair, granularity=settings.candle_granularity_seconds, limit=50
-                )
-            except Exception:
-                log.exception("Candles failed for %s", pair)
-                continue
-            stake = min(settings.bankroll_usd, 5.0)
-            signal = mean_reversion_signal(pair, candles, notional_usd=stake)
-            if signal is None:
-                continue
-            # Fee-dominance only when strategy tags an explicit edge_bps
-            edge = signal.meta.get("edge_bps")
-            decision = check_proposal(
-                signal,
-                settings,
-                self.risk_state,
-                expected_edge_bps=float(edge) if edge is not None else None,
-            )
-            if not decision.ok:
-                self.journal.log_event(
-                    "risk_reject",
-                    {"reason": decision.reason, "product": pair},
-                )
-                log.info("Risk reject %s: %s", pair, decision.reason)
-                continue
-            signal.notional_usd = decision.stake_usd
-            signal.expires_at = utcnow() + timedelta(
-                seconds=settings.proposal_expiry_seconds
-            )
-            self.store.register(signal, ttl_seconds=settings.proposal_expiry_seconds)
-            self._pending_stake[signal.proposal_id] = decision.stake_usd
-            self.journal.save_proposal(signal)
-            out.append(signal)
-        return out
+        with self._lock:
+            self.store.expire_due()
+            if self.killed or any(p.status == S.SUBMITTING for p in self.store.active()):
+                return []
+            out = []
+            for pair in self.settings.strategy_pairs:
+                try:
+                    if any(p.product_id == pair for p in self.store.active()):
+                        continue
+                    candles = self.market.candles(pair, granularity=900, limit=50)
+                    now = utcnow()
+                    if not candles or (now - candles[-1].ts).total_seconds() > 1800:
+                        raise ValueError("stale_candles")
+                    signal = mean_reversion_signal(pair, candles,
+                        notional_usd=min(self.settings.bankroll_usd, 5.0), now=now)
+                    if signal is None:
+                        continue
+                    book = self._book(pair)
+                    stake, size = self._check(signal, book)
+                    signal.notional_usd = stake
+                    if size is not None:
+                        signal.meta["base_size"] = size
+                    marks = {pair: book.mid}
+                    for held in self.account.positions:
+                        if held not in marks:
+                            marks[held] = self._book(held).mid
+                    signal.meta["account_equity_usd"] = self.account.equity(marks)
+                    signal.meta["cash_usd"] = self.account.cash_usd
+                    signal.expires_at = now + timedelta(seconds=self.settings.proposal_expiry_seconds)
+                    self.store.register(signal)
+                    out.append(signal)
+                except Exception as exc:
+                    self.journal.log_event("scan_reject", {"product": pair, "reason": str(exc)})
+            return out
+
+    def status(self) -> str:
+        with self._lock:
+            return (f"mode={self.settings.mode} bankroll=${self.settings.bankroll_usd:.2f} "
+                    f"cash=${self.account.cash_usd:.2f} killed={self.killed} "
+                    f"positions={len(self.account.positions)} "
+                    f"unresolved={sum(p.status == S.SUBMITTING for p in self.store.active())}")
 
     async def loop(self) -> None:
         assert self.bot is not None
         while True:
-            self.store.expire_due()
-            if not self.kill.engaged:
+            try:
+                # Reconcile even while killed. This records existing effects, not new trades.
+                await asyncio.to_thread(self.reconcile_pending)
+                for p in list(self.store.active()):
+                    if p.status == S.APPROVED:
+                        await self.on_approved(p)
                 proposals = await asyncio.to_thread(self.scan_once)
-                for p in proposals:
-                    bal = (
-                        self.risk_state.cash_usd
-                        if self.risk_state.cash_usd is not None
-                        else self.settings.bankroll_usd
-                    )
-                    await self.bot.publish_proposal(p, account_balance_usd=bal)
+                # Also republish pending proposals that survived a crash before publication.
+                for p in self.store.active():
+                    if p.status == S.PENDING and (p in proposals or not p.meta.get("discord_message_id")):
+                        await self.bot.publish_proposal(p, p.meta["account_equity_usd"])
+            except Exception:
+                log.exception("Worker iteration failed; durable state retained")
             await asyncio.sleep(self.settings.poll_interval_seconds)
 
     async def run_async(self) -> None:
-        if not self.settings.discord_token:
-            log.error("DISCORD_TOKEN required to run worker")
-            raise SystemExit(1)
-        self.bot = TayderBot(
-            self.settings,
-            self.store,
-            on_approved=self.on_approved,
-            on_kill=self.engage_kill,
-            on_resume=self.clear_kill,
-        )
-        async with self.bot:
-            t = asyncio.create_task(self.bot.start(self.settings.discord_token))
-            # wait until ready-ish
-            for _ in range(50):
-                if self.bot.is_ready():
-                    break
-                await asyncio.sleep(0.2)
-            loop_task = asyncio.create_task(self.loop())
-            try:
-                await t
-            finally:
-                loop_task.cancel()
-                self.market.close()
-                self.journal.close()
+        if not self.settings.discord_token or not self.settings.discord_channel_id:
+            self.close()
+            raise ValueError("DISCORD_TOKEN and DISCORD_CHANNEL_ID required to run worker")
+        self.bot = TayderBot(self.settings, self.store, on_approved=self.on_approved,
+            on_kill=self.engage_kill, on_resume=self.clear_kill, status_provider=self.status)
+        try:
+            async with self.bot:
+                task = asyncio.create_task(self.bot.start(self.settings.discord_token))
+                # Wait for login; unsent proposals retry when the channel resolves.
+                ready = asyncio.create_task(self.bot.wait_until_ready())
+                done, _ = await asyncio.wait((task, ready), return_when=asyncio.FIRST_COMPLETED)
+                if task in done:
+                    ready.cancel()
+                    await task
+                    return
+                loop_task = asyncio.create_task(self.loop())
+                try:
+                    await task
+                finally:
+                    loop_task.cancel()
+                    await asyncio.gather(loop_task, return_exceptions=True)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        # Wait for any in-flight to_thread execution before releasing journal ownership.
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.market.close()
+            if self.executor:
+                self.executor.close()
+            self.journal.close()
+            if self._owner:
+                self._owner.close()
 
     def run(self) -> None:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        )
-        log.info(
-            "Starting tayder mode=%s bankroll=$%s pairs=%s",
-            self.settings.mode,
-            self.settings.bankroll_usd,
-            self.settings.strategy_pairs,
-        )
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
         asyncio.run(self.run_async())
 
 
 def run_paper_dry_scan() -> None:
-    """No-Discord one-shot scan for local smoke (still needs network for candles)."""
-    logging.basicConfig(level=logging.INFO)
-    w = Worker()
-    props = w.scan_once()
-    for p in props:
-        print(p)
-    w.market.close()
-    w.journal.close()
+    """Isolated paper scan; never changes the production journal or submits orders."""
+    settings = replace(load_settings(), mode="paper", journal_db_path=":memory:")
+    worker = Worker(settings)
+    try:
+        for p in worker.scan_once():
+            print(p)
+    finally:
+        worker.close()
