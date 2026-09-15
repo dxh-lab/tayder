@@ -1,0 +1,16 @@
+services:
+  tayder:
+    build: .
+    env_file: .env
+    environment:
+      MODE: ${MODE:-paper}
+      BANKROLL_USD: ${BANKROLL_USD:-10}
+      JOURNAL_DB_PATH: /app/data/tayder.db
+    volumes:
+      - tayder-data:/app/data
+      # Optional: mount CDP key file read-only
+      # - ./secrets/cdp_api_key.pem:/run/secrets/cdp_api_key.pem:ro
+    restart: unless-stopped
+
+volumes:
+  tayder-data:
