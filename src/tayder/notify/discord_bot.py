@@ -77,15 +77,39 @@ class ProposalView(View):
         self.stop()
 
 
-def proposal_embed(p: Proposal, mode: str) -> discord.Embed:
+def risk_summary(notional_usd: float, signal_price: float, account_balance_usd: float) -> str:
+    """Human line: stake, price, balance, and % of balance at risk."""
+    if account_balance_usd > 0:
+        pct = notional_usd / account_balance_usd * 100.0
+    else:
+        pct = 0.0
+    return (
+        f"Proposing ${notional_usd:.2f} @ {signal_price:.2f}. "
+        f"Acct Balance: ${account_balance_usd:.2f} ({pct:.0f}%)"
+    )
+
+
+def proposal_embed(
+    p: Proposal, mode: str, account_balance_usd: float
+) -> discord.Embed:
     color = discord.Color.green() if p.side.value == "BUY" else discord.Color.red()
+    summary = risk_summary(p.notional_usd, p.signal_price, account_balance_usd)
     emb = discord.Embed(
         title=f"{p.side.value} {p.product_id}",
-        description=p.reason,
+        description=f"{summary}\n\n{p.reason}",
         color=color,
     )
-    emb.add_field(name="Notional", value=f"${p.notional_usd:.2f}")
-    emb.add_field(name="Signal", value=f"{p.signal_price:.2f}")
+    emb.add_field(name="Stake", value=f"${p.notional_usd:.2f}")
+    emb.add_field(name="Price", value=f"{p.signal_price:.2f}")
+    pct = (
+        p.notional_usd / account_balance_usd * 100.0
+        if account_balance_usd > 0
+        else 0.0
+    )
+    emb.add_field(
+        name="Acct Balance",
+        value=f"${account_balance_usd:.2f} ({pct:.0f}%)",
+    )
     emb.add_field(name="Mode", value=mode.upper())
     emb.set_footer(text=f"id={p.proposal_id}")
     return emb
@@ -167,10 +191,17 @@ class TayderBot(discord.Client):
                     ch = None
             self._channel = ch  # type: ignore[assignment]
 
-    async def publish_proposal(self, proposal: Proposal) -> None:
+    async def publish_proposal(
+        self, proposal: Proposal, account_balance_usd: float | None = None
+    ) -> None:
         if self._channel is None:
             log.warning("No Discord channel; proposal %s not sent", proposal.proposal_id)
             return
+        balance = (
+            float(account_balance_usd)
+            if account_balance_usd is not None
+            else float(self.settings.bankroll_usd)
+        )
         view = ProposalView(
             proposal.proposal_id,
             self.store,
@@ -178,5 +209,6 @@ class TayderBot(discord.Client):
             on_approved=self.on_approved,
         )
         await self._channel.send(
-            embed=proposal_embed(proposal, self.settings.mode), view=view
+            embed=proposal_embed(proposal, self.settings.mode, balance),
+            view=view,
         )

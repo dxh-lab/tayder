@@ -160,7 +160,12 @@ class Worker:
             if not self.kill.engaged:
                 proposals = await asyncio.to_thread(self.scan_once)
                 for p in proposals:
-                    await self.bot.publish_proposal(p)
+                    bal = (
+                        self.risk_state.cash_usd
+                        if self.risk_state.cash_usd is not None
+                        else self.settings.bankroll_usd
+                    )
+                    await self.bot.publish_proposal(p, account_balance_usd=bal)
             await asyncio.sleep(self.settings.poll_interval_seconds)
 
     async def run_async(self) -> None:
