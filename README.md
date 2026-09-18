@@ -57,9 +57,13 @@ copy only the main `.db` file from a running WAL database.
    checks kill state, expiry, cash, per-product inventory, open positions,
    cooldown, daily loss, spread, price movement and the cost filter again.
 4. BUYs require an explicit distance-to-mean estimate greater than round-trip
-   fees + full spread + two-sided slippage + the configured buffer. This is a
-   cost screen, **not evidence of an edge**. The distance is recomputed against
-   the original signal mean at the new executable price.
+   fees + full spread + two-sided slippage + the configured buffer when
+   `ENFORCE_FEE_DOMINANCE` is on (live default). Paper defaults to advisory:
+   the proposal still posts with a cost warning so you get an Approve/Skip
+   action. Distance to mean is a cost screen, **not evidence of an edge**. The
+   distance is recomputed against the original signal mean at the new
+   executable price. Discord is notified only when a fresh z-entry cross
+   clears the other gates — not on skipped scans or continuation bars.
 5. SELLs use a frozen base quantity from strategy-owned inventory, capped by
    current exchange-available inventory in live mode. Unrelated Coinbase
    holdings never become strategy capital. Exits remain possible after the

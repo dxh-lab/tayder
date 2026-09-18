@@ -162,6 +162,10 @@ class Worker:
             expected_edge_bps=float(edge) if edge is not None else None, spread_bps=book.spread_bps)
         if not decision.ok:
             raise ValueError(decision.reason)
+        if decision.required_edge_bps is not None:
+            p.meta["required_edge_bps"] = decision.required_edge_bps
+            p.meta["executable_edge_bps"] = float(edge) if edge is not None else None
+            p.meta["cost_warning"] = decision.cost_warning
         base_size = None
         stake = decision.stake_usd
         if p.side == Side.SELL:
@@ -295,9 +299,22 @@ class Worker:
                     now = utcnow()
                     if not candles or (now - candles[-1].ts).total_seconds() > 1800:
                         raise ValueError("stale_candles")
-                    signal = mean_reversion_signal(pair, candles,
-                        notional_usd=min(self.settings.bankroll_usd, 5.0), now=now)
+                    signal_kwargs = dict(
+                        lookback=self.settings.strategy_lookback,
+                        z_entry=self.settings.strategy_z_entry,
+                        notional_usd=min(self.settings.bankroll_usd, 5.0),
+                    )
+                    signal = mean_reversion_signal(pair, candles, now=now, **signal_kwargs)
                     if signal is None:
+                        continue
+                    # One Discord action per fresh entry: ignore continuation bars
+                    # so a sustained z-score does not re-ping every expiry window.
+                    prior = mean_reversion_signal(
+                        pair, candles,
+                        now=now - timedelta(seconds=self.settings.candle_granularity_seconds),
+                        **signal_kwargs,
+                    )
+                    if prior is not None and prior.side == signal.side:
                         continue
                     book = self._book(pair)
                     stake, size = self._check(signal, book)

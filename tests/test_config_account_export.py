@@ -18,6 +18,7 @@ from tayder.research import load_candles_csv
     {'strategy_pairs': ('BTC-USD', 'BTC-USD')}, {'strategy_pairs': ('DOGE-USD',)},
     {'slippage_bps': 10000}, {'max_book_age_seconds': float('nan')},
     {'cooldown_seconds': -1}, {'candle_granularity_seconds': 60},
+    {'strategy_lookback': 1}, {'strategy_z_entry': 0}, {'strategy_z_entry': float('nan')},
 ])
 def test_invalid_settings_rejected(kwargs):
     with pytest.raises(ValueError):
@@ -26,6 +27,37 @@ def test_invalid_settings_rejected(kwargs):
 
 def test_default_settings_valid():
     Settings().validate()
+
+
+def test_load_settings_paper_defaults_fee_gate_advisory(monkeypatch, tmp_path):
+    from tayder.config import load_settings
+    monkeypatch.setenv('MODE', 'paper')
+    monkeypatch.delenv('ENFORCE_FEE_DOMINANCE', raising=False)
+    env = tmp_path / '.env'
+    env.write_text('')
+    settings = load_settings(str(env))
+    assert settings.mode == 'paper'
+    assert settings.enforce_fee_dominance is False
+
+
+def test_load_settings_live_defaults_fee_gate_enforced(monkeypatch, tmp_path):
+    from tayder.config import load_settings
+    monkeypatch.setenv('MODE', 'live')
+    monkeypatch.delenv('ENFORCE_FEE_DOMINANCE', raising=False)
+    env = tmp_path / '.env'
+    env.write_text('')
+    settings = load_settings(str(env))
+    assert settings.mode == 'live'
+    assert settings.enforce_fee_dominance is True
+
+
+def test_load_settings_honors_explicit_fee_gate_override(monkeypatch, tmp_path):
+    from tayder.config import load_settings
+    monkeypatch.setenv('MODE', 'live')
+    monkeypatch.setenv('ENFORCE_FEE_DOMINANCE', 'false')
+    env = tmp_path / '.env'
+    env.write_text('')
+    assert load_settings(str(env)).enforce_fee_dominance is False
 
 
 def fill(side, size=.05, price=100, fee=.03, **kwargs):

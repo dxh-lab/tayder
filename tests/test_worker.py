@@ -69,6 +69,7 @@ class Exchange:
 def worker_factory(tmp_path):
     workers = []
     def create(*, path=None, live=False, market=None, exchange=None, **changes):
+        changes.setdefault("enforce_fee_dominance", live)
         settings = Settings(journal_db_path=str(path or tmp_path / f'account-{len(workers)}.db'),
             mode="live" if live else "paper", discord_allowlist=frozenset({1}),
             coinbase_api_key_name="test", coinbase_api_private_key="fake-used-by-mock-only",
@@ -96,6 +97,13 @@ def saved_account(w, cash=5, size=.05, pair="BTC-USD"):
     w.account.cash_usd = cash
     w.account.positions = {pair: Position(size, 5)}
     w.journal.set_state('account', w.account.to_dict())
+
+
+def _fresh_entry_signal(pair, *a, now=None, **kw):
+    """Mock: signal on the current bar only so edge-trigger tests stay stable."""
+    if now is not None and (utcnow() - now).total_seconds() > 60:
+        return None
+    return Proposal(pair, Side.BUY, 5, 'test', 100, meta={'estimated_edge_bps': 500, 'sma': 105})
 
 
 def test_buy_sell_roundtrip_books_actual_cash_inventory_fees_and_loss(worker_factory):
@@ -136,14 +144,45 @@ def test_unapproved_cannot_execute(worker_factory):
 
 def test_same_scan_and_later_scan_reserve_one_position(worker_factory, monkeypatch):
     w = worker_factory()
-    monkeypatch.setattr('tayder.worker.mean_reversion_signal', lambda pair, *a, **kw:
-        Proposal(pair, Side.BUY, 5, 'test', 100, meta={'estimated_edge_bps': 500}))
+    monkeypatch.setattr('tayder.worker.mean_reversion_signal', _fresh_entry_signal)
     proposals = w.scan_once()
     assert len(proposals) == 1
     assert w.scan_once() == []
     assert w._risk_state().reserved_cash == pytest.approx(5.03)
     w.store.skip(proposals[0].proposal_id)
     assert len(w.scan_once()) == 1
+
+
+def test_scan_skips_continuation_bars_without_re_notifying(worker_factory, monkeypatch):
+    w = worker_factory()
+    monkeypatch.setattr(
+        'tayder.worker.mean_reversion_signal',
+        lambda pair, *a, now=None, **kw: Proposal(
+            pair, Side.BUY, 5, 'test', 100, meta={'estimated_edge_bps': 500, 'sma': 105}),
+    )
+    assert w.scan_once() == []
+
+
+def test_paper_scan_proposes_when_fees_dominate_if_not_enforced(worker_factory, monkeypatch):
+    w = worker_factory(enforce_fee_dominance=False, taker_fee_bps=60, fee_dominance_bps=20)
+    def low_edge(pair, *a, now=None, **kw):
+        if now is not None and (utcnow() - now).total_seconds() > 60:
+            return None
+        return Proposal(pair, Side.BUY, 5, 'test', 100, meta={'estimated_edge_bps': 40, 'sma': 100.4})
+    monkeypatch.setattr('tayder.worker.mean_reversion_signal', low_edge)
+    p, = w.scan_once()
+    assert p.meta.get('cost_warning') is True
+    assert p.meta.get('required_edge_bps') == pytest.approx(140)  # 2*60 + 20; factory sets slippage=0
+
+
+def test_live_scan_still_hard_blocks_fee_dominance(worker_factory, monkeypatch):
+    w = worker_factory(live=True, enforce_fee_dominance=True)
+    def low_edge(pair, *a, now=None, **kw):
+        if now is not None and (utcnow() - now).total_seconds() > 60:
+            return None
+        return Proposal(pair, Side.BUY, 5, 'test', 100, meta={'estimated_edge_bps': 40, 'sma': 100.4})
+    monkeypatch.setattr('tayder.worker.mean_reversion_signal', low_edge)
+    assert w.scan_once() == []
 
 
 def test_restored_pending_reservations_skip_expiry_and_kill(worker_factory):
@@ -397,8 +436,11 @@ def test_paper_interrupted_intent_never_replays(worker_factory):
 def test_equity_display_includes_holdings(worker_factory, monkeypatch):
     w = worker_factory()
     saved_account(w)
-    monkeypatch.setattr('tayder.worker.mean_reversion_signal', lambda pair, *a, **kw:
-        Proposal(pair, Side.SELL, 5, 'test', 100, meta={'estimated_edge_bps': 500}))
+    def sell_signal(pair, *a, now=None, **kw):
+        if now is not None and (utcnow() - now).total_seconds() > 60:
+            return None
+        return Proposal(pair, Side.SELL, 5, 'test', 100, meta={'estimated_edge_bps': 500})
+    monkeypatch.setattr('tayder.worker.mean_reversion_signal', sell_signal)
     p, = w.scan_once()
     assert p.meta['account_equity_usd'] == 10
     assert p.meta['cash_usd'] == 5
