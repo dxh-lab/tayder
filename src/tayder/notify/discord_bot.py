@@ -122,6 +122,17 @@ def proposal_embed(
         value=f"${account_balance_usd:.2f} ({pct:.0f}%)",
     )
     emb.add_field(name="Mode", value=mode.upper())
+    edge = p.meta.get("executable_edge_bps", p.meta.get("estimated_edge_bps"))
+    required = p.meta.get("required_edge_bps")
+    if edge is not None and required is not None:
+        try:
+            edge_f, req_f = float(edge), float(required)
+            cost_line = f"{edge_f:.0f} bps distance vs {req_f:.0f} bps round-trip costs"
+            if p.meta.get("cost_warning"):
+                cost_line += " — fees dominate; Approve is your call"
+            emb.add_field(name="Cost screen", value=cost_line, inline=False)
+        except (TypeError, ValueError):
+            pass
     emb.add_field(name="Signal", value="Distance to mean; unvalidated hypothesis", inline=False)
     emb.set_footer(text=f"id={p.proposal_id}")
     return emb

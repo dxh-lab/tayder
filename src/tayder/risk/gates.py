@@ -26,6 +26,14 @@ class RiskDecision:
     ok: bool
     reason: str
     stake_usd: float = 0.0
+    required_edge_bps: float | None = None
+    cost_warning: bool = False
+
+
+def required_edge_bps(settings: Settings, spread_bps: float = 0.0) -> float:
+    """Round-trip taker fees + buffer + full spread + two-sided slippage."""
+    return (2 * settings.taker_fee_bps + settings.fee_dominance_bps
+            + spread_bps + 2 * settings.slippage_bps)
 
 
 def refresh_day(state: RiskState, now: datetime | None = None) -> None:
@@ -82,7 +90,8 @@ def check_proposal(proposal: Proposal, settings: Settings, state: RiskState, *,
         return RiskDecision(False, "daily_loss_stop", stake)
     if expected_edge_bps is None or not math.isfinite(expected_edge_bps):
         return RiskDecision(False, "edge_unknown", stake)
-    required = 2 * settings.taker_fee_bps + settings.fee_dominance_bps + spread_bps + 2 * settings.slippage_bps
-    if expected_edge_bps <= required:
-        return RiskDecision(False, "fee_dominance", stake)
-    return RiskDecision(True, "ok", stake)
+    required = required_edge_bps(settings, spread_bps)
+    dominated = expected_edge_bps <= required
+    if dominated and settings.enforce_fee_dominance:
+        return RiskDecision(False, "fee_dominance", stake, required_edge_bps=required, cost_warning=True)
+    return RiskDecision(True, "ok", stake, required_edge_bps=required, cost_warning=dominated)

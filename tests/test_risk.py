@@ -107,12 +107,26 @@ def test_fee_dominance():
     # RT fees = 120 bps; edge 50 + buffer 20 → dominated
     d = check_proposal(
         _prop(),
-        _settings(taker_fee_bps=60, fee_dominance_bps=20),
+        _settings(taker_fee_bps=60, fee_dominance_bps=20, enforce_fee_dominance=True),
         RiskState(),
         expected_edge_bps=50,
     )
     assert not d.ok
     assert d.reason == "fee_dominance"
+    assert d.cost_warning
+    assert d.required_edge_bps == pytest.approx(160)
+
+
+def test_fee_advisory_allows_proposal_with_warning():
+    d = check_proposal(
+        _prop(),
+        _settings(taker_fee_bps=60, fee_dominance_bps=20, enforce_fee_dominance=False),
+        RiskState(),
+        expected_edge_bps=50,
+    )
+    assert d.ok
+    assert d.cost_warning
+    assert d.required_edge_bps == pytest.approx(160)
 
 
 def test_fee_ok_when_edge_large():
@@ -123,6 +137,7 @@ def test_fee_ok_when_edge_large():
         expected_edge_bps=200,
     )
     assert d.ok
+    assert not d.cost_warning
 
 
 def test_kill_switch():
