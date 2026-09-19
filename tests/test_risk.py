@@ -51,10 +51,30 @@ def test_stake_capped_to_bankroll():
     assert d.stake_usd * 1.006 == pytest.approx(10.0)
 
 
-def test_bankroll_over_10_refused():
-    d = check_proposal(_prop(), _settings(bankroll_usd=11), RiskState())
+def test_bankroll_over_mode_cap_refused():
+    d = check_proposal(_prop(), _settings(mode="paper", bankroll_usd=101), RiskState())
     assert not d.ok
     assert d.reason == "bankroll_out_of_bounds"
+    d = check_proposal(_prop(), _settings(mode="live", bankroll_usd=11), RiskState())
+    assert not d.ok
+    assert d.reason == "bankroll_out_of_bounds"
+
+
+def test_paper_allows_100_bankroll_live_still_caps_at_10():
+    assert check_proposal(
+        _prop(notional_usd=50),
+        _settings(mode="paper", bankroll_usd=100),
+        RiskState(cash_usd=100),
+        expected_edge_bps=300,
+    ).ok
+    d = check_proposal(
+        _prop(),
+        _settings(mode="live", bankroll_usd=100, coinbase_api_key_name="k",
+                  coinbase_api_private_key="p", discord_allowlist=frozenset({1})),
+        RiskState(),
+        expected_edge_bps=300,
+    )
+    assert not d.ok and d.reason == "bankroll_out_of_bounds"
 
 
 def test_below_min_notional():

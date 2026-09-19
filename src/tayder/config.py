@@ -9,6 +9,14 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# Paper can use a larger sandbox bankroll; live stays hard-capped at $10.
+MAX_PAPER_BANKROLL_USD = 100.0
+MAX_LIVE_BANKROLL_USD = 10.0
+
+
+def max_bankroll_for_mode(mode: str) -> float:
+    return MAX_PAPER_BANKROLL_USD if mode == "paper" else MAX_LIVE_BANKROLL_USD
+
 
 def _f(name: str, default: float) -> float:
     return float(os.getenv(name, str(default)))
@@ -29,7 +37,7 @@ class Settings:
     discord_channel_id: int = 0
     discord_allowlist: frozenset[int] = field(default_factory=frozenset)
     mode: str = "paper"  # paper | live
-    bankroll_usd: float = 10.0
+    bankroll_usd: float = 100.0
     max_open_positions: int = 1
     min_notional_usd: float = 1.0
     cooldown_seconds: int = 300
@@ -58,6 +66,10 @@ class Settings:
     max_book_age_seconds: int = 60
     slippage_bps: float = 10.0
 
+    @property
+    def max_bankroll_usd(self) -> float:
+        return max_bankroll_for_mode(self.mode)
+
     def validate(self) -> None:
         if self.mode not in ("paper", "live"):
             raise ValueError("MODE must be paper or live")
@@ -69,8 +81,10 @@ class Settings:
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"Invalid {name}")
-        if not 0 < self.bankroll_usd <= 10:
-            raise ValueError("bankroll must be positive and at most $10")
+        if not 0 < self.bankroll_usd <= self.max_bankroll_usd:
+            raise ValueError(
+                f"bankroll must be positive and at most ${self.max_bankroll_usd:.0f} in {self.mode} mode"
+            )
         if not 0 < self.min_notional_usd <= self.bankroll_usd:
             raise ValueError("Invalid min_notional_usd")
         if not 0 < self.daily_loss_stop_pct <= 1:
@@ -124,8 +138,8 @@ def load_settings(env_file: str | None = None) -> Settings:
     allow = _csv("DISCORD_ALLOWLIST_USER_IDS")
     pairs = _csv("STRATEGY_PAIRS", "BTC-USD,ETH-USD")
     channel = os.getenv("DISCORD_CHANNEL_ID", "0") or "0"
-    bankroll = _f("BANKROLL_USD", 10.0)
     mode = os.getenv("MODE", "paper").lower()
+    bankroll = _f("BANKROLL_USD", 100.0 if mode == "paper" else 10.0)
     # Paper defaults to advisory costs so Discord actually gets Approve/Skip
     # actions; live keeps the hard screen unless explicitly overridden.
     enforce_default = mode == "live"

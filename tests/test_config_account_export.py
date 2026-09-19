@@ -10,7 +10,9 @@ from tayder.research import load_candles_csv
 
 
 @pytest.mark.parametrize('kwargs', [
-    {'mode': 'unknown'}, {'bankroll_usd': 11}, {'bankroll_usd': float('nan')},
+    {'mode': 'unknown'}, {'bankroll_usd': 101}, {'bankroll_usd': float('nan')},
+    {'mode': 'live', 'bankroll_usd': 11, 'discord_allowlist': frozenset({1}),
+     'coinbase_api_key_name': 'key', 'coinbase_api_private_key': 'pem'},
     {'coinbase_api_base': 'https://attacker.test'}, {'mode': 'live'},
     {'mode': 'live', 'discord_allowlist': frozenset({1})},
     {'mode': 'live', 'coinbase_api_key_name': 'key', 'coinbase_api_private_key': 'pem'},
@@ -27,6 +29,15 @@ def test_invalid_settings_rejected(kwargs):
 
 def test_default_settings_valid():
     Settings().validate()
+
+
+def test_paper_bankroll_100_valid_live_10_max():
+    Settings(mode='paper', bankroll_usd=100).validate()
+    Settings(mode='live', bankroll_usd=10, discord_allowlist=frozenset({1}),
+             coinbase_api_key_name='key', coinbase_api_private_key='pem').validate()
+    with pytest.raises(ValueError, match='at most \\$10'):
+        Settings(mode='live', bankroll_usd=100, discord_allowlist=frozenset({1}),
+                 coinbase_api_key_name='key', coinbase_api_private_key='pem').validate()
 
 
 def test_load_settings_paper_defaults_fee_gate_advisory(monkeypatch, tmp_path):

@@ -70,6 +70,7 @@ def worker_factory(tmp_path):
     workers = []
     def create(*, path=None, live=False, market=None, exchange=None, **changes):
         changes.setdefault("enforce_fee_dominance", live)
+        changes.setdefault("bankroll_usd", 10.0 if live else 10.0)
         settings = Settings(journal_db_path=str(path or tmp_path / f'account-{len(workers)}.db'),
             mode="live" if live else "paper", discord_allowlist=frozenset({1}),
             coinbase_api_key_name="test", coinbase_api_private_key="fake-used-by-mock-only",
@@ -103,7 +104,9 @@ def _fresh_entry_signal(pair, *a, now=None, **kw):
     """Mock: signal on the current bar only so edge-trigger tests stay stable."""
     if now is not None and (utcnow() - now).total_seconds() > 60:
         return None
-    return Proposal(pair, Side.BUY, 5, 'test', 100, meta={'estimated_edge_bps': 500, 'sma': 105})
+    notional = float(kw.get("notional_usd", 5))
+    return Proposal(pair, Side.BUY, notional, 'test', 100,
+                    meta={'estimated_edge_bps': 500, 'sma': 105})
 
 
 def test_buy_sell_roundtrip_books_actual_cash_inventory_fees_and_loss(worker_factory):
@@ -151,6 +154,14 @@ def test_same_scan_and_later_scan_reserve_one_position(worker_factory, monkeypat
     assert w._risk_state().reserved_cash == pytest.approx(5.03)
     w.store.skip(proposals[0].proposal_id)
     assert len(w.scan_once()) == 1
+
+
+def test_paper_scan_uses_half_bankroll_notional(worker_factory, monkeypatch):
+    w = worker_factory(bankroll_usd=100, enforce_fee_dominance=False)
+    monkeypatch.setattr('tayder.worker.mean_reversion_signal', _fresh_entry_signal)
+    p, = w.scan_once()
+    assert p.notional_usd == pytest.approx(50.0)
+    assert w.account.cash_usd == pytest.approx(100.0)
 
 
 def test_scan_skips_continuation_bars_without_re_notifying(worker_factory, monkeypatch):

@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from tayder.config import Settings
+from tayder.config import Settings, max_bankroll_for_mode
 from tayder.models import Proposal, Side
 
 
@@ -56,7 +56,8 @@ def check_proposal(proposal: Proposal, settings: Settings, state: RiskState, *,
         return RiskDecision(False, "invalid_side")
     if proposal.product_id not in settings.strategy_pairs:
         return RiskDecision(False, "invalid_product")
-    if not math.isfinite(settings.bankroll_usd) or not 0 < settings.bankroll_usd <= 10:
+    max_bankroll = max_bankroll_for_mode(settings.mode)
+    if not math.isfinite(settings.bankroll_usd) or not 0 < settings.bankroll_usd <= max_bankroll:
         return RiskDecision(False, "bankroll_out_of_bounds")
     if not all(math.isfinite(v) and v > 0 for v in (proposal.notional_usd, proposal.signal_price)):
         return RiskDecision(False, "invalid_amount")
