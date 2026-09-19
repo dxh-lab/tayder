@@ -70,7 +70,7 @@ def worker_factory(tmp_path):
     workers = []
     def create(*, path=None, live=False, market=None, exchange=None, **changes):
         changes.setdefault("enforce_fee_dominance", live)
-        changes.setdefault("bankroll_usd", 10.0 if live else 10.0)
+        changes.setdefault("bankroll_usd", 10.0)
         settings = Settings(journal_db_path=str(path or tmp_path / f'account-{len(workers)}.db'),
             mode="live" if live else "paper", discord_allowlist=frozenset({1}),
             coinbase_api_key_name="test", coinbase_api_private_key="fake-used-by-mock-only",
