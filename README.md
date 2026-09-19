@@ -3,7 +3,7 @@
 A Discord-gated **BTC/ETH spot trading experiment** for Coinbase Advanced Trade.
 The 15-minute mean-reversion strategy proposes a trade; an allowlisted user
 approves or skips it. Paper mode is the default. The configured starting bankroll
-must be positive and at most **$10**.
+must be positive: at most **$100** in paper and **$10** in live.
 
 The strategy is an **unvalidated hypothesis**. Distance to a moving average is
 not an expected return. Fees, spreads, delayed approvals and changing prices can
@@ -111,10 +111,11 @@ failed to force trading to restart. A permanently unresolvable intent requires
 operator investigation before a journal repair.
 
 A journal is bound to its mode, starting bankroll and live key name. Changing
-those in place refuses startup. Keep paper and live journals separate. Existing
-paper journals can replay valid fills; legacy live journals containing estimated
-fills or unresolved proposals refuse automatic migration and require comparison
-with actual Coinbase history first.
+those in place refuses startup (for example, moving paper from $10 to $100
+needs a new `JOURNAL_DB_PATH` or a wiped paper journal). Keep paper and live
+journals separate. Existing paper journals can replay valid fills; legacy live
+journals containing estimated fills or unresolved proposals refuse automatic
+migration and require comparison with actual Coinbase history first.
 
 ## Optional live mode
 

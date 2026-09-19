@@ -302,7 +302,8 @@ class Worker:
                     signal_kwargs = dict(
                         lookback=self.settings.strategy_lookback,
                         z_entry=self.settings.strategy_z_entry,
-                        notional_usd=min(self.settings.bankroll_usd, 5.0),
+                        # Half the configured bankroll per proposal (was $5 on a $10 book).
+                        notional_usd=self.settings.bankroll_usd * 0.5,
                     )
                     signal = mean_reversion_signal(pair, candles, now=now, **signal_kwargs)
                     if signal is None:

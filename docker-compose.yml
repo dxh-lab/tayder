@@ -4,7 +4,7 @@ services:
     env_file: .env
     environment:
       MODE: ${MODE:-paper}
-      BANKROLL_USD: ${BANKROLL_USD:-10}
+      BANKROLL_USD: ${BANKROLL_USD:-100}
       JOURNAL_DB_PATH: /app/data/tayder.db
     volumes:
       - tayder-data:/app/data
