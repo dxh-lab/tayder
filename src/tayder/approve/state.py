@@ -14,7 +14,8 @@ class ApprovalError(Exception):
 
 
 class ApprovalStore:
-    def __init__(self, default_ttl_seconds: int = 300, journal=None, *, lock=None) -> None:
+    def __init__(self, default_ttl_seconds: int = 300, journal=None, *, lock=None, clock=None) -> None:
+        self.now = clock or utcnow
         self.default_ttl_seconds = default_ttl_seconds
         self.journal = journal
         self._lock = lock or RLock()
@@ -31,7 +32,7 @@ class ApprovalStore:
             if proposal.proposal_id in self._by_id:
                 raise ApprovalError("duplicate_proposal_id")
             if proposal.expires_at is None:
-                proposal.expires_at = utcnow() + timedelta(seconds=ttl_seconds if ttl_seconds is not None else self.default_ttl_seconds)
+                proposal.expires_at = self.now() + timedelta(seconds=ttl_seconds if ttl_seconds is not None else self.default_ttl_seconds)
             proposal.status = S.PENDING
             return self._save(proposal)
 
@@ -50,7 +51,7 @@ class ApprovalStore:
     def approve(self, proposal_id: str, *, now: datetime | None = None) -> Proposal:
         with self._lock:
             p = self._require(proposal_id)
-            self._expire(p, now or utcnow())
+            self._expire(p, now or self.now())
             if p.status == S.APPROVED:
                 return p
             if p.status != S.PENDING:
@@ -61,7 +62,7 @@ class ApprovalStore:
     def skip(self, proposal_id: str, *, now: datetime | None = None) -> Proposal:
         with self._lock:
             p = self._require(proposal_id)
-            self._expire(p, now or utcnow())
+            self._expire(p, now or self.now())
             if p.status == S.SKIPPED:
                 return p
             if p.status != S.PENDING:
@@ -100,7 +101,7 @@ class ApprovalStore:
             expired = []
             for p in self.active():
                 before = p.status
-                self._expire(p, now or utcnow())
+                self._expire(p, now or self.now())
                 if before != p.status:
                     expired.append(p)
             return expired

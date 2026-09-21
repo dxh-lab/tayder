@@ -27,7 +27,10 @@ log = logging.getLogger(__name__)
 
 
 class Worker:
-    def __init__(self, settings: Settings | None = None, *, market=None, executor=None) -> None:
+    def __init__(self, settings: Settings | None = None, *, market=None, executor=None, clock=None, jev_client=None) -> None:
+        self.now = clock or utcnow
+        self._shadow_lock = threading.Lock()
+        self.jev_client = jev_client
         self.settings = settings or load_settings()
         self.settings.validate()
         self._lock = threading.RLock()
@@ -75,7 +78,7 @@ class Worker:
                 if saved_account is None:
                     raise ValueError("Journal is missing its durable account state")
                 self.account = Account.from_dict(saved_account)
-            self.store = ApprovalStore(self.settings.proposal_expiry_seconds, self.journal, lock=self._lock)
+            self.store = ApprovalStore(self.settings.proposal_expiry_seconds, self.journal, lock=self._lock, clock=self.now)
             if self.account.killed or self.settings.killed:
                 self._kill_requested.set()
             self.store.expire_due()
@@ -117,7 +120,7 @@ class Worker:
     def _risk_state(self, exclude: str | None = None) -> RiskState:
         active = [p for p in self.store.active() if p.proposal_id != exclude]
         buys = [p for p in active if p.side == Side.BUY]
-        day = utcnow().strftime("%Y-%m-%d")
+        day = self.now().strftime("%Y-%m-%d")
         return RiskState(open_positions=len(self.account.positions),
             cash_usd=self.account.cash_usd, holdings={k: p.size for k, p in self.account.positions.items()},
             last_trade_at=self.account.last_trade_at, day_key=day,
@@ -130,7 +133,7 @@ class Worker:
         if book.product_id != pair or not all(math.isfinite(v) and v > 0 for v in
                 (book.bid, book.ask, book.bid_size, book.ask_size)) or book.ask < book.bid:
             raise ValueError("invalid_book")
-        age = (utcnow() - book.ts).total_seconds()
+        age = (self.now() - book.ts).total_seconds()
         if age < -5 or age > self.settings.max_book_age_seconds:
             raise ValueError("stale_book")
         if book.spread_bps > self.settings.max_spread_bps:
@@ -161,7 +164,7 @@ class Worker:
             edge = (float(p.meta["sma"]) - price) / price * 10_000
         current = replace(p, signal_price=price)
         decision = check_proposal(current, replace(self.settings, killed=self.killed), state,
-            expected_edge_bps=float(edge) if edge is not None else None, spread_bps=book.spread_bps)
+            now=self.now(), expected_edge_bps=float(edge) if edge is not None else None, spread_bps=book.spread_bps)
         if not decision.ok:
             raise ValueError(decision.reason)
         if decision.required_edge_bps is not None:
@@ -272,7 +275,7 @@ class Worker:
                     self._check(p, book)
                     fill = paper_fill(p, book, stake_usd=stake,
                         base_size=base_size, taker_fee_bps=self.settings.taker_fee_bps,
-                        slippage_bps=self.settings.slippage_bps)
+                        slippage_bps=self.settings.slippage_bps, filled_at=self.now())
                     self._book_fill(p, fill)
             except (OrderRejected, ValueError) as exc:
                 # These execution API exceptions guarantee no uncertain POST.
@@ -305,7 +308,7 @@ class Worker:
                    candle_at: str | None = None) -> None:
         self._last_scan[pair] = {
             "z": z, "side": side, "reason": reason, "candle_at": candle_at,
-            "at": utcnow().isoformat(),
+            "at": self.now().isoformat(),
         }
 
     def scan_once(self) -> list[Proposal]:
@@ -321,7 +324,7 @@ class Worker:
                         self._note_scan(pair, z=None, side=None, reason="inventory_reserved")
                         continue
                     candles = self.market.candles(pair, granularity=900, limit=50)
-                    now = utcnow()
+                    now = self.now()
                     # Require the latest completed 15m bar (not merely "start < 30m ago",
                     # which goes false right when the next bar should appear).
                     expected = self._expected_completed_candle_start(now)
@@ -384,6 +387,14 @@ class Worker:
                     signal.meta["cash_usd"] = self.account.cash_usd
                     signal.expires_at = now + timedelta(seconds=self.settings.proposal_expiry_seconds)
                     self.store.register(signal)
+                    if self.settings.jev_mode == "shadow" and signal.side == Side.BUY:
+                        try:
+                            from tayder.decision.snapshot import make_request
+                            request = make_request(signal, candles, book, self.settings.jev_model)
+                            self.journal.enqueue_decision(signal.proposal_id, request)
+                        except Exception as exc:
+                            # Optional telemetry must never suppress an existing proposal.
+                            log.warning("Shadow snapshot unavailable: %s", type(exc).__name__)
                     self._note_scan(
                         pair, z=signal.meta.get("z"), side=signal.side.value,
                         reason="proposed", candle_at=candle_at,
@@ -411,7 +422,40 @@ class Worker:
                 parts.append("scan[" + "; ".join(scans) + "]")
             else:
                 parts.append("scan=none_yet")
+            if self.settings.jev_mode == "shadow":
+                latest = self.journal.latest_decision()
+                if latest:
+                    request, result = latest
+                    label = result.get("answer", {}).get("choice", "unavailable")
+                    parts.append(f"Jev experimental context: {request['state']['product_id']} {label} (not profit odds)")
+                else:
+                    parts.append("Jev shadow: awaiting assessment")
             return " ".join(parts)
+
+    def evaluate_shadow_once(self) -> None:
+        """No worker lock, trading state mutation, or authority to approve orders."""
+        if self.settings.jev_mode != "shadow":
+            return
+        with self._shadow_lock:
+            if self._closed:
+                return
+            job = self.journal.next_decision()
+            if job is None:
+                return
+            from tayder.decision.jev import JevClient
+            client = self.jev_client or JevClient(self.settings.typesafe_api_key,
+                                                self.settings.jev_timeout_seconds)
+            result = client.evaluate(job["request"])
+            result["available_at"] = self.now().isoformat()
+            self.journal.finish_decision(job["decision_id"], result)
+
+    async def shadow_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.to_thread(self.evaluate_shadow_once)
+            except Exception as exc:
+                log.warning("Shadow evaluation unavailable: %s", type(exc).__name__)
+            await asyncio.sleep(1)
 
     async def loop(self) -> None:
         assert self.bot is not None
@@ -448,17 +492,19 @@ class Worker:
                     await task
                     return
                 loop_task = asyncio.create_task(self.loop())
+                shadow_task = asyncio.create_task(self.shadow_loop())
                 try:
                     await task
                 finally:
                     loop_task.cancel()
-                    await asyncio.gather(loop_task, return_exceptions=True)
+                    shadow_task.cancel()
+                    await asyncio.gather(loop_task, shadow_task, return_exceptions=True)
         finally:
             self.close()
 
     def close(self) -> None:
-        # Wait for any in-flight to_thread execution before releasing journal ownership.
-        with self._lock:
+        # Shadow requests never acquire the worker lock; wait before closing SQLite.
+        with self._shadow_lock, self._lock:
             if self._closed:
                 return
             self._closed = True
@@ -476,7 +522,7 @@ class Worker:
 
 def run_paper_dry_scan() -> None:
     """Isolated paper scan; never changes the production journal or submits orders."""
-    settings = replace(load_settings(), mode="paper", journal_db_path=":memory:")
+    settings = replace(load_settings(), mode="paper", journal_db_path=":memory:", jev_mode="off")
     worker = Worker(settings)
     try:
         for p in worker.scan_once():

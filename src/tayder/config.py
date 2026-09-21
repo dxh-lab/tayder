@@ -66,11 +66,22 @@ class Settings:
     max_book_age_seconds: int = 60
     slippage_bps: float = 10.0
 
+    jev_mode: str = "off"
+    typesafe_api_key: str = field(default="", repr=False)
+    jev_model: str = "jev-latest"
+    jev_timeout_seconds: float = 2.0
+
     @property
     def max_bankroll_usd(self) -> float:
         return max_bankroll_for_mode(self.mode)
 
     def validate(self) -> None:
+        if self.jev_mode not in ("off", "shadow"):
+            raise ValueError("JEV_MODE must be off or shadow; trading filters are not enabled")
+        if self.jev_mode == "shadow" and not self.typesafe_api_key:
+            raise ValueError("JEV shadow mode requires TYPESAFE_API_KEY")
+        if not self.jev_model.strip() or not math.isfinite(self.jev_timeout_seconds) or not 0 < self.jev_timeout_seconds <= 10:
+            raise ValueError("Invalid Jev model or timeout (maximum 10 seconds)")
         if self.mode not in ("paper", "live"):
             raise ValueError("MODE must be paper or live")
         if self.coinbase_api_base != "https://api.coinbase.com":
@@ -144,6 +155,10 @@ def load_settings(env_file: str | None = None) -> Settings:
     # actions; live keeps the hard screen unless explicitly overridden.
     enforce_default = mode == "live"
     return Settings(
+        jev_mode=os.getenv("JEV_MODE", "off").lower(),
+        typesafe_api_key=os.getenv("TYPESAFE_API_KEY", ""),
+        jev_model=os.getenv("JEV_MODEL", "jev-latest"),
+        jev_timeout_seconds=_f("JEV_TIMEOUT_SECONDS", 2),
         discord_token=os.getenv("DISCORD_TOKEN", ""),
         discord_channel_id=int(channel),
         discord_allowlist=frozenset(int(x) for x in allow),

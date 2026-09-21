@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from uuid import uuid4
+from datetime import datetime
+from tayder.models import utcnow
 
 from tayder.models import Fill, Proposal, Side, TopOfBook
 
@@ -16,6 +18,7 @@ def paper_fill(
     mode: str = "paper",
     base_size: float | None = None,
     slippage_bps: float = 0.0,
+    filled_at: datetime | None = None,
 ) -> Fill:
     if proposal.side == Side.BUY:
         price = book.ask * (1 + slippage_bps / 10_000)
@@ -38,4 +41,5 @@ def paper_fill(
         notional_usd=stake_usd,
         mode=mode,
         order_id=f"paper-{uuid4()}",
+        filled_at=filled_at or utcnow(),
     )

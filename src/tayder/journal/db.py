@@ -11,6 +11,10 @@ from pathlib import Path
 from tayder.models import Fill, Proposal, ProposalStatus, Side, utcnow
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS decisions (
+ decision_id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL, request_json TEXT NOT NULL,
+ result_json TEXT, created_at TEXT NOT NULL);
+
 CREATE TABLE IF NOT EXISTS proposals (
  proposal_id TEXT PRIMARY KEY, product_id TEXT NOT NULL, side TEXT NOT NULL,
  notional_usd REAL NOT NULL, reason TEXT NOT NULL, signal_price REAL NOT NULL,
@@ -109,3 +113,35 @@ class Journal:
         with self._lock:
             self._conn.execute("INSERT INTO events(ts,kind,payload_json) VALUES (?,?,?)",
                                (utcnow().isoformat(), kind, json.dumps(payload, allow_nan=False)))
+
+    def enqueue_decision(self, proposal_id: str, request: dict) -> str:
+        import hashlib
+        encoded = json.dumps(request, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        key = hashlib.sha256(encoded.encode()).hexdigest()
+        with self._lock:
+            self._conn.execute("INSERT OR IGNORE INTO decisions VALUES (?,?,?,?,?)",
+                               (key, proposal_id, encoded, None, utcnow().isoformat()))
+        return key
+
+    def next_decision(self):
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM decisions WHERE result_json IS NULL ORDER BY created_at LIMIT 1").fetchone()
+            return {**dict(row), "request": json.loads(row["request_json"])} if row else None
+
+    def finish_decision(self, key: str, result: dict) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE decisions SET result_json=? WHERE decision_id=? AND result_json IS NULL",
+                               (json.dumps(result, allow_nan=False), key))
+
+    def decisions(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM decisions ORDER BY created_at").fetchall()
+            return [{"decision_id": r["decision_id"], "proposal_id": r["proposal_id"],
+                     "request": json.loads(r["request_json"]),
+                     "result": json.loads(r["result_json"]) if r["result_json"] else None}
+                    for r in rows]
+
+    def latest_decision(self):
+        with self._lock:
+            row = self._conn.execute("SELECT request_json, result_json FROM decisions WHERE result_json IS NOT NULL ORDER BY created_at DESC LIMIT 1").fetchone()
+            return (json.loads(row[0]), json.loads(row[1])) if row else None
