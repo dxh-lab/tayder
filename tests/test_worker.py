@@ -105,8 +105,19 @@ def _fresh_entry_signal(pair, *a, now=None, **kw):
     if now is not None and (utcnow() - now).total_seconds() > 60:
         return None
     notional = float(kw.get("notional_usd", 5))
+    # Stable completed-bar id (previous 15m interval start).
+    candle = utcnow().replace(second=0, microsecond=0)
+    candle -= timedelta(minutes=candle.minute % 15)
+    candle -= timedelta(minutes=15)
     return Proposal(pair, Side.BUY, notional, 'test', 100,
-                    meta={'estimated_edge_bps': 500, 'sma': 105})
+                    meta={'estimated_edge_bps': 500, 'sma': 105,
+                          'z': -2.0, 'signal_candle_at': candle.isoformat()})
+
+
+def _completed_candle_start():
+    candle = utcnow().replace(second=0, microsecond=0)
+    candle -= timedelta(minutes=candle.minute % 15)
+    return candle - timedelta(minutes=15)
 
 
 def test_buy_sell_roundtrip_books_actual_cash_inventory_fees_and_loss(worker_factory):
@@ -146,19 +157,51 @@ def test_unapproved_cannot_execute(worker_factory):
 
 
 def test_same_scan_and_later_scan_reserve_one_position(worker_factory, monkeypatch):
-    w = worker_factory()
+    w = worker_factory(strategy_pairs=("BTC-USD",))
     monkeypatch.setattr('tayder.worker.mean_reversion_signal', _fresh_entry_signal)
+    monkeypatch.setattr(
+        'tayder.worker.mean_reversion_snapshot',
+        lambda *a, **kw: None,
+    )
     proposals = w.scan_once()
     assert len(proposals) == 1
     assert w.scan_once() == []
     assert w._risk_state().reserved_cash == pytest.approx(5.03)
     w.store.skip(proposals[0].proposal_id)
-    assert len(w.scan_once()) == 1
+    # Same 15m candle must not re-ping after Skip (expiry is shorter than a candle).
+    assert w.scan_once() == []
+    assert w._last_scan['BTC-USD']['reason'] == 'already_proposed_candle'
+
+
+def test_new_signal_candle_can_fire_after_prior_skip(worker_factory, monkeypatch):
+    w = worker_factory()
+    candle = _completed_candle_start()
+
+    def shifting(pair, *a, now=None, **kw):
+        if now is not None and (utcnow() - now).total_seconds() > 60:
+            return None
+        # First proposal uses candle T; after skip, pretend a new fresh cross on T+15m.
+        used = any(
+            p.meta.get('signal_candle_at') == candle.isoformat()
+            for p in w.store.all_proposals()
+        )
+        at = candle if not used else candle + timedelta(minutes=15)
+        return Proposal(pair, Side.BUY, float(kw.get('notional_usd', 5)), 'test', 100,
+                        meta={'estimated_edge_bps': 500, 'sma': 105, 'z': -2.0,
+                              'signal_candle_at': at.isoformat()})
+
+    monkeypatch.setattr('tayder.worker.mean_reversion_signal', shifting)
+    monkeypatch.setattr('tayder.worker.mean_reversion_snapshot', lambda *a, **kw: None)
+    first, = w.scan_once()
+    w.store.skip(first.proposal_id)
+    second, = w.scan_once()
+    assert second.meta['signal_candle_at'] != first.meta['signal_candle_at']
 
 
 def test_paper_scan_uses_half_bankroll_notional(worker_factory, monkeypatch):
     w = worker_factory(bankroll_usd=100, enforce_fee_dominance=False)
     monkeypatch.setattr('tayder.worker.mean_reversion_signal', _fresh_entry_signal)
+    monkeypatch.setattr('tayder.worker.mean_reversion_snapshot', lambda *a, **kw: None)
     p, = w.scan_once()
     assert p.notional_usd == pytest.approx(50.0)
     assert w.account.cash_usd == pytest.approx(100.0)
@@ -169,9 +212,12 @@ def test_scan_skips_continuation_bars_without_re_notifying(worker_factory, monke
     monkeypatch.setattr(
         'tayder.worker.mean_reversion_signal',
         lambda pair, *a, now=None, **kw: Proposal(
-            pair, Side.BUY, 5, 'test', 100, meta={'estimated_edge_bps': 500, 'sma': 105}),
+            pair, Side.BUY, 5, 'test', 100,
+            meta={'estimated_edge_bps': 500, 'sma': 105, 'signal_candle_at': 'c1'}),
     )
+    monkeypatch.setattr('tayder.worker.mean_reversion_snapshot', lambda *a, **kw: None)
     assert w.scan_once() == []
+    assert w._last_scan['BTC-USD']['reason'] == 'continuation'
 
 
 def test_paper_scan_proposes_when_fees_dominate_if_not_enforced(worker_factory, monkeypatch):
@@ -179,8 +225,11 @@ def test_paper_scan_proposes_when_fees_dominate_if_not_enforced(worker_factory, 
     def low_edge(pair, *a, now=None, **kw):
         if now is not None and (utcnow() - now).total_seconds() > 60:
             return None
-        return Proposal(pair, Side.BUY, 5, 'test', 100, meta={'estimated_edge_bps': 40, 'sma': 100.4})
+        return Proposal(pair, Side.BUY, 5, 'test', 100,
+                        meta={'estimated_edge_bps': 40, 'sma': 100.4,
+                              'signal_candle_at': _completed_candle_start().isoformat()})
     monkeypatch.setattr('tayder.worker.mean_reversion_signal', low_edge)
+    monkeypatch.setattr('tayder.worker.mean_reversion_snapshot', lambda *a, **kw: None)
     p, = w.scan_once()
     assert p.meta.get('cost_warning') is True
     assert p.meta.get('required_edge_bps') == pytest.approx(140)  # 2*60 + 20; factory sets slippage=0
@@ -191,9 +240,22 @@ def test_live_scan_still_hard_blocks_fee_dominance(worker_factory, monkeypatch):
     def low_edge(pair, *a, now=None, **kw):
         if now is not None and (utcnow() - now).total_seconds() > 60:
             return None
-        return Proposal(pair, Side.BUY, 5, 'test', 100, meta={'estimated_edge_bps': 40, 'sma': 100.4})
+        return Proposal(pair, Side.BUY, 5, 'test', 100,
+                        meta={'estimated_edge_bps': 40, 'sma': 100.4,
+                              'signal_candle_at': _completed_candle_start().isoformat()})
     monkeypatch.setattr('tayder.worker.mean_reversion_signal', low_edge)
+    monkeypatch.setattr('tayder.worker.mean_reversion_snapshot', lambda *a, **kw: None)
     assert w.scan_once() == []
+
+
+def test_status_includes_last_scan_decision(worker_factory, monkeypatch):
+    w = worker_factory()
+    monkeypatch.setattr('tayder.worker.mean_reversion_signal', _fresh_entry_signal)
+    monkeypatch.setattr('tayder.worker.mean_reversion_snapshot', lambda *a, **kw: None)
+    w.scan_once()
+    text = w.status()
+    assert 'scan[' in text and 'proposed' in text
+    assert 'BTC-USD z=' in text
 
 
 def test_restored_pending_reservations_skip_expiry_and_kill(worker_factory):
@@ -450,11 +512,25 @@ def test_equity_display_includes_holdings(worker_factory, monkeypatch):
     def sell_signal(pair, *a, now=None, **kw):
         if now is not None and (utcnow() - now).total_seconds() > 60:
             return None
-        return Proposal(pair, Side.SELL, 5, 'test', 100, meta={'estimated_edge_bps': 500})
+        return Proposal(pair, Side.SELL, 5, 'test', 100,
+                        meta={'estimated_edge_bps': 500,
+                              'signal_candle_at': _completed_candle_start().isoformat()})
     monkeypatch.setattr('tayder.worker.mean_reversion_signal', sell_signal)
+    monkeypatch.setattr('tayder.worker.mean_reversion_snapshot', lambda *a, **kw: None)
     p, = w.scan_once()
     assert p.meta['account_equity_usd'] == 10
     assert p.meta['cash_usd'] == 5
+
+
+def test_expiry_does_not_re_ping_same_signal_candle(worker_factory, monkeypatch):
+    w = worker_factory(strategy_pairs=("BTC-USD",))
+    monkeypatch.setattr('tayder.worker.mean_reversion_signal', _fresh_entry_signal)
+    monkeypatch.setattr('tayder.worker.mean_reversion_snapshot', lambda *a, **kw: None)
+    first, = w.scan_once()
+    w.store.expire_due(now=utcnow() + timedelta(hours=1))
+    assert first.status == S.EXPIRED
+    assert w.scan_once() == []
+    assert w._last_scan['BTC-USD']['reason'] == 'already_proposed_candle'
 
 
 def test_exchange_cash_rechecked_after_intent_before_post(worker_factory):

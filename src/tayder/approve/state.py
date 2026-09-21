@@ -43,6 +43,10 @@ class ApprovalStore:
         with self._lock:
             return [p for p in self._by_id.values() if p.status in (S.PENDING, S.APPROVED, S.SUBMITTING)]
 
+    def all_proposals(self) -> list[Proposal]:
+        with self._lock:
+            return list(self._by_id.values())
+
     def approve(self, proposal_id: str, *, now: datetime | None = None) -> Proposal:
         with self._lock:
             p = self._require(proposal_id)
