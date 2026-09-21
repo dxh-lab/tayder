@@ -222,3 +222,84 @@ restrictions, durable approvals/reservations, per-product inventory, kill timing
 restart recovery, duplicate callbacks, ambiguous orders, partial fills, atomic
 ledger rollback, Discord recovery and temporal/accounting research invariants.
 No real Discord or Coinbase credentials are used by the tests.
+
+## Jev: experimental shadow assessments
+
+Jev is optional and **off by default**. Set `JEV_MODE=shadow` and
+`TYPESAFE_API_KEY` to collect market-context classifications on eligible BUY
+proposals. `JEV_MODEL` defaults to `jev-latest`; use a provider-supported fixed
+version for a frozen experiment. `JEV_TIMEOUT_SECONDS` defaults to 2 (maximum
+10, HTTP operation timeout). The response's actual model version is recorded.
+The official contract is documented at <https://docs.typesafe.ai/api>.
+
+A separate background task sends only public, completed-price features and quote
+metadata to TypeSafe. It holds no trading lock, cannot approve or filter trades,
+and cannot change sizing, exits, reconciliation, or hard risk checks. Existing
+Discord approvals remain required. `/status` labels the latest classification
+as experimental context, not profit odds. No news feed is included.
+
+Snapshots and results live in an additive SQLite `decisions` table. Each request
+is hashed including its model, questions and snapshot; identical requests reuse
+the stored result across restarts. API errors are recorded as unavailable without
+response bodies or secrets, and are not repeatedly retried. A crash after the API
+returns but before SQLite commits can cause another read-only evaluation. Old
+queued snapshots retain their original observation times; they never become new
+trade proposals. Snapshot enqueue failures are logged without suppressing trades.
+
+Export observations with a read-only database connection:
+
+```bash
+python -m tayder.decision.export --journal data/tayder.db \
+  --output data/research/jev-observations.json
+```
+
+## Worker-based research replay
+
+The existing `tayder.research` walk-forward simulator remains available. The new
+replay **runs the actual paper Worker** against an injected historical clock and
+synthetic quotes. This includes fresh-cross and candle deduplication, shared
+BTC/ETH cash, one-position reservations, fee-date accounting, approval expiry,
+cooldown, daily-loss, drift, spread and cost checks. It never connects to Coinbase,
+Discord or TypeSafe and never reads runtime credentials or the production journal.
+
+```bash
+python -m tayder.replay --csv data/research/2025-q1.csv \
+  --compare-simple --output data/research/worker-comparison.json
+
+python -m tayder.replay --csv data/research/forward-paper.csv \
+  --compare-simple --jev-observations data/research/jev-observations.json \
+  --confidence-threshold 0.8 --output data/research/jev-comparison.json
+```
+
+CLI assumptions: $10 shared cash, half-bankroll proposals, 60 bps taker fees,
+10 bps adverse slippage, 4 bps full spread, enforced cost screen, 60-second
+hypothetical approvals. Python callers can supply `Settings` to `replay()`;
+it always forces paper mode, an in-memory journal and Jev off. Pair order follows
+CSV asset insertion order and is recorded. Synthetic quotes hold each bar's open
+constant until the next bar; no unknown intrabar path is interpolated. Approval
+delay rounds up to the next worker poll. Current candle closes/highs/lows/volume
+never enter a signal; terminal inventory is marked at the final close, unsold.
+
+The simple comparator skips BUYs when the lookback's final close is below its
+first close. The optional **offline-only** Jev comparator accepts a BUY only with
+a recorded `range_bound` answer meeting the chosen confidence threshold and
+available by simulated approval time. Missing, late, unavailable or uncertain
+answers skip that simulated BUY and missing coverage is reported. SELL behavior
+is unchanged. These are hypotheses, not recommended trading policies.
+
+Reports include settings, candle and observation fingerprints, proposals, fills,
+scan reasons, equity, net returns, fees, turnover, exposure and drawdown. Random
+order identifiers are removed for reproducibility. A replay uses one fixed
+configuration, not automatic parameter selection. Evaluate frozen policies on
+later chronological periods and multiple regimes. Do not pick thresholds using
+the held-out outcomes. Compare lost opportunities as well as avoided losses;
+less trading alone is not evidence of intelligence. Historical model knowledge
+can contaminate retrospective tests. Prefer prospective paper observations.
+
+Observations are collected only where the baseline worker proposes a BUY. A
+filtered policy can reach different account states and need observations that
+were never collected: inspect `missing_observations`, and do not treat an
+incomplete comparison as validation. Select a single model/question version for
+a comparison; duplicate asset/candle records are rejected. Candle replay cannot
+reconstruct actual liquidity, human decisions, partial fills or exchange precision.
+No Jev profitability result or live filter is claimed by this implementation.
