@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 import threading
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from tayder.account import Account
 from tayder.approve.state import ApprovalStore
@@ -21,7 +21,7 @@ from tayder.journal.db import Journal
 from tayder.models import Fill, Proposal, ProposalStatus as S, Side, utcnow
 from tayder.notify.discord_bot import TayderBot
 from tayder.risk.gates import RiskState, check_proposal
-from tayder.strategy.baseline import mean_reversion_signal
+from tayder.strategy.baseline import mean_reversion_signal, mean_reversion_snapshot
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +88,8 @@ class Worker:
         self.market = market or CoinbasePublicMarket(max_age_seconds=self.settings.max_book_age_seconds)
         self.executor = executor or (LiveCoinbaseExecutor(self.settings) if self.settings.is_live else None)
         self.bot: TayderBot | None = None
+        # Last per-pair scan decision for /status (z, side, reason). Not durable.
+        self._last_scan: dict[str, dict] = {}
 
     @property
     def killed(self) -> bool:
@@ -285,37 +287,89 @@ class Worker:
                 else:
                     self._fail(p, type(exc).__name__)
 
+    def _expected_completed_candle_start(self, now: datetime) -> datetime:
+        gran = self.settings.candle_granularity_seconds
+        aligned = int(now.timestamp()) // gran * gran
+        return datetime.fromtimestamp(aligned - gran, tz=timezone.utc)
+
+    def _already_proposed_candle(self, pair: str, candle_at: str | None) -> bool:
+        """True if this product already got a Discord proposal for this bar."""
+        if not candle_at:
+            return False
+        return any(
+            p.product_id == pair and p.meta.get("signal_candle_at") == candle_at
+            for p in self.store.all_proposals()
+        )
+
+    def _note_scan(self, pair: str, *, z: float | None, side: str | None, reason: str,
+                   candle_at: str | None = None) -> None:
+        self._last_scan[pair] = {
+            "z": z, "side": side, "reason": reason, "candle_at": candle_at,
+            "at": utcnow().isoformat(),
+        }
+
     def scan_once(self) -> list[Proposal]:
         with self._lock:
             self.store.expire_due()
             if self.killed or any(p.status == S.SUBMITTING for p in self.store.active()):
                 return []
             out = []
+            gran = self.settings.candle_granularity_seconds
             for pair in self.settings.strategy_pairs:
                 try:
                     if any(p.product_id == pair for p in self.store.active()):
+                        self._note_scan(pair, z=None, side=None, reason="inventory_reserved")
                         continue
                     candles = self.market.candles(pair, granularity=900, limit=50)
                     now = utcnow()
-                    if not candles or (now - candles[-1].ts).total_seconds() > 1800:
+                    # Require the latest completed 15m bar (not merely "start < 30m ago",
+                    # which goes false right when the next bar should appear).
+                    expected = self._expected_completed_candle_start(now)
+                    if not candles or candles[-1].ts < expected:
                         raise ValueError("stale_candles")
                     signal_kwargs = dict(
                         lookback=self.settings.strategy_lookback,
                         z_entry=self.settings.strategy_z_entry,
                         # Half the configured bankroll per proposal (was $5 on a $10 book).
                         notional_usd=self.settings.bankroll_usd * 0.5,
+                        granularity_seconds=gran,
+                    )
+                    snap = mean_reversion_snapshot(
+                        candles, lookback=self.settings.strategy_lookback,
+                        z_entry=self.settings.strategy_z_entry, now=now,
+                        granularity_seconds=gran,
                     )
                     signal = mean_reversion_signal(pair, candles, now=now, **signal_kwargs)
                     if signal is None:
+                        self._note_scan(
+                            pair,
+                            z=None if snap is None else snap.z,
+                            side=None,
+                            reason="no_signal",
+                            candle_at=None if snap is None else snap.candle_at.isoformat(),
+                        )
                         continue
+                    candle_at = signal.meta.get("signal_candle_at")
                     # One Discord action per fresh entry: ignore continuation bars
-                    # so a sustained z-score does not re-ping every expiry window.
+                    # so a sustained z-score does not re-ping every bar.
                     prior = mean_reversion_signal(
                         pair, candles,
-                        now=now - timedelta(seconds=self.settings.candle_granularity_seconds),
+                        now=now - timedelta(seconds=gran),
                         **signal_kwargs,
                     )
                     if prior is not None and prior.side == signal.side:
+                        self._note_scan(
+                            pair, z=signal.meta.get("z"), side=signal.side.value,
+                            reason="continuation", candle_at=candle_at,
+                        )
+                        continue
+                    # Expiry is 5m; candles are 15m. Without candle dedupe the same
+                    # fresh cross re-fires after every skip/expiry on that bar.
+                    if self._already_proposed_candle(pair, candle_at):
+                        self._note_scan(
+                            pair, z=signal.meta.get("z"), side=signal.side.value,
+                            reason="already_proposed_candle", candle_at=candle_at,
+                        )
                         continue
                     book = self._book(pair)
                     stake, size = self._check(signal, book)
@@ -330,17 +384,34 @@ class Worker:
                     signal.meta["cash_usd"] = self.account.cash_usd
                     signal.expires_at = now + timedelta(seconds=self.settings.proposal_expiry_seconds)
                     self.store.register(signal)
+                    self._note_scan(
+                        pair, z=signal.meta.get("z"), side=signal.side.value,
+                        reason="proposed", candle_at=candle_at,
+                    )
                     out.append(signal)
                 except Exception as exc:
+                    self._note_scan(pair, z=None, side=None, reason=f"reject:{exc}")
                     self.journal.log_event("scan_reject", {"product": pair, "reason": str(exc)})
             return out
 
     def status(self) -> str:
         with self._lock:
-            return (f"mode={self.settings.mode} bankroll=${self.settings.bankroll_usd:.2f} "
-                    f"cash=${self.account.cash_usd:.2f} killed={self.killed} "
-                    f"positions={len(self.account.positions)} "
-                    f"unresolved={sum(p.status == S.SUBMITTING for p in self.store.active())}")
+            parts = [
+                f"mode={self.settings.mode} bankroll=${self.settings.bankroll_usd:.2f}",
+                f"cash=${self.account.cash_usd:.2f} killed={self.killed}",
+                f"positions={len(self.account.positions)}",
+                f"unresolved={sum(p.status == S.SUBMITTING for p in self.store.active())}",
+            ]
+            if self._last_scan:
+                scans = []
+                for pair, info in self._last_scan.items():
+                    z = info.get("z")
+                    z_s = "n/a" if z is None else f"{z:.2f}"
+                    scans.append(f"{pair} z={z_s} {info.get('reason')}")
+                parts.append("scan[" + "; ".join(scans) + "]")
+            else:
+                parts.append("scan=none_yet")
+            return " ".join(parts)
 
     async def loop(self) -> None:
         assert self.bot is not None

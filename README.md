@@ -62,8 +62,11 @@ copy only the main `.db` file from a running WAL database.
    the proposal still posts with a cost warning so you get an Approve/Skip
    action. Distance to mean is a cost screen, **not evidence of an edge**. The
    distance is recomputed against the original signal mean at the new
-   executable price. Discord is notified only when a fresh z-entry cross
-   clears the other gates — not on skipped scans or continuation bars.
+   executable price. Discord is notified only on a **fresh z-entry cross** that
+   clears the other gates — not on skipped scans, continuation bars, or the
+   same 15m candle after Skip/expiry (proposal TTL is shorter than a candle).
+   `/status` shows the last per-pair scan decision (`no_signal`, `continuation`,
+   `already_proposed_candle`, `proposed`, or a reject reason) and the latest z.
 5. SELLs use a frozen base quantity from strategy-owned inventory, capped by
    current exchange-available inventory in live mode. Unrelated Coinbase
    holdings never become strategy capital. Exits remain possible after the
